@@ -3,6 +3,7 @@ bin/apply_diff_relay_logs
 bin/filter_mysqlbinlog
 bin/purge_relay_logs
 bin/save_binary_logs
+bin/check_rvip
 COPYING
 debian/changelog
 debian/compat

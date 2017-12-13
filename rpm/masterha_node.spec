@@ -9,7 +9,7 @@ URL: http://code.google.com/p/mysql-master-ha/
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 BuildArch: noarch
 BuildRequires: perl(ExtUtils::MakeMaker) >= 6.30
-Requires: perl(DBD::mysql) >= 4.031
+Requires: perl(DBD::mysql) >= 4.012
 Requires: perl(DBI)
 Source0: mha4mysql-node-%{version}.tar.gz
 
@@ -55,6 +55,7 @@ rm -rf $RPM_BUILD_ROOT
 %defattr(-,root,root,-)
 
 %changelog
+
 * Sun May 31 2015 Yoshinori Matsunobu <Yoshinori.Matsunobu@gmail.com>
 - (Note: All changelogs are written here: http://code.google.com/p/mysql-master-ha/wiki/ReleaseNotes )
 - Version 0.57

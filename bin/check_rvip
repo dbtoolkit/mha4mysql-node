@@ -1,0 +1,556 @@
+#!/usr/bin/env perl
+# Description： 检查mysql读vip健康, 脚本退出状态码说明: 0:正常  1:异常（触发vip切换）
+# Authors:  
+#   zhaoyunbo
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Spec;
+use Log::Log4perl;
+use Parallel::ForkManager;
+use DBI;
+use POSIX qw(:signal_h);
+use Fcntl qw(:flock);
+
+
+# 数据库连接信息
+my $host = "127.0.0.1";
+my $username = "mysql";
+my $password = "xxxx";
+
+# mha vip配置文件
+my $mhaVipConf = "/etc/mha_vip.conf";
+
+# 检查失败重试次数
+my $checkRetry = 10;
+
+# 单次失败检查重试时间间隔
+my $intervalTime = 1;
+
+# 以下情况是mysql活着, 但mysql dbi连接错误, 属于可控制, 不切换读vip
+my @ALIVE_ERROR_CODES = (
+    1040,    # ER_CON_COUNT_ERROR
+    1042,    # ER_BAD_HOST_ERROR
+    1043,    # ER_HANDSHAKE_ERROR
+    1044,    # ER_DBACCESS_DENIED_ERROR
+    1045,    # ER_ACCESS_DENIED_ERROR
+    1129,    # ER_HOST_IS_BLOCKED
+    1130,    # ER_HOST_NOT_PRIVILEGED
+    1203,    # ER_TOO_MANY_USER_CONNECTIONS
+    1226,    # ER_USER_LIMIT_REACHED
+    1251,    # ER_NOT_SUPPORTED_AUTH_MODE
+    1275,    # ER_SERVER_IS_IN_SECURE_AUTH_MODE
+);
+
+my $scriptName = $0;
+
+# 接收参数
+my ( $vrrpInstance, $totalTimeout );
+GetOptions(
+    "vrrp-instance=s" => \$vrrpInstance,
+    "total-timeout-seconds=i" => \$totalTimeout
+);
+
+# 检查参数值
+if ( ! defined($vrrpInstance) ) {
+    print "--vrrp-instance= is needed\n";
+    exit 0;
+}
+if ( ! defined($totalTimeout) ) {
+    print "--total-timeout-seconds= is needed\n";
+    exit 0;
+}
+
+# 初始化log4perl
+my $checkLog = "/var/log/check_rvip_$vrrpInstance.log";
+my $logConf = q(
+    log4perl.rootLogger                = DEBUG, logfile
+    log4perl.appender.logfile          = Log::Log4perl::Appender::File
+    log4perl.appender.logfile.mode     = append
+    log4perl.appender.logfile.layout   = Log::Log4perl::Layout::PatternLayout
+    log4perl.appender.logfile.layout.ConversionPattern = %d{yyyy-MM-dd HH:mm:ss}  [%p] [%M] %m%n
+);
+$logConf .= "log4perl.appender.logfile.filename = $checkLog";
+Log::Log4perl->init( \$logConf );
+
+my $log = Log::Log4perl->get_logger("");  # get logObject
+
+# 标识一次检查流程 
+my $flag = int(rand(100000));
+$log->info("===============  begin($flag)  =================");
+
+# 设置文件锁，防止脚本并行执行
+my $lockFile="/tmp/check_rvip_$vrrpInstance.lock";
+$log->info("start get lockfile");
+my $flockStatus=getFileLock("$lockFile");
+my $flockExitCode = $$flockStatus{'exitCode'};
+if ($flockExitCode != 0){
+    $log->error("$scriptName is running");
+    exit 0;
+}
+$log->info("get lockfile: $lockFile success");
+
+
+if ( ! -e $mhaVipConf ) { 
+    $log->error("get mha vip conf failed");
+    cleanFileLock($lockFile);
+    $log->info("remove $lockFile success");
+    $log->info("==  end($flag) ==");
+    exit 0;
+}
+
+# 解析配置文件
+my @mhaVipConfData = `grep -v "#" $mhaVipConf | grep -w $vrrpInstance`;
+chomp(@mhaVipConfData);
+
+foreach my $line (@mhaVipConfData){
+    $line =~ s/^\s+//g;
+    my ( $ismaintain,$viptype,$port,$vrrp,$vip,$gotofault ) = (split(/\s+/, $line));
+    
+    # vrrp实例不匹配，正常退出
+    if ( lc($vrrpInstance) ne lc($vrrp) ) {
+        $log->info("$port $vrrpInstance is not $vrrp");
+        
+        my $delLock = cleanFileLock($lockFile);
+        if (!$delLock){
+            $log->error("remove $lockFile failed");
+        }else{
+            $log->info("remove $lockFile success");
+        }
+        $log->info("==  end($flag) ==");
+        
+        exit 0;
+    }
+    
+    # 类型不为rvip，正常退出
+    if ( lc($viptype) ne "rvip" ) {
+        $log->info("viptype:$viptype is not rvip");
+        
+        my $delLock = cleanFileLock($lockFile);
+        if (!$delLock){
+            $log->error("remove $lockFile failed");
+        }else{
+            $log->info("remove $lockFile success");
+        }
+        $log->info("==  end($flag) ==");
+        
+        exit 0;
+    }
+    
+    # 维护模式为"y"，正常退出
+    if ( lc($ismaintain) eq "y" ) {
+        $log->info("rvip:$vip is in maintain mode");
+        
+        my $delLock = cleanFileLock($lockFile);
+        if (!$delLock){
+            $log->error("remove $lockFile failed");
+        }else{
+            $log->info("remove $lockFile success");
+        }
+        $log->info("==  end($flag) ==");
+        
+        exit 0;
+    }
+    
+    # 若gotofault为"Y"，则进行主从切换
+    if( lc($gotofault) eq "y" ) {
+        $log->error("rvip:$vip gotofault is y");
+        $log->error("rvip:$vip will switchover");
+        
+        my $delLock = cleanFileLock($lockFile);
+        if (!$delLock){
+            $log->error("remove $lockFile failed");
+        }else{
+            $log->info("remove $lockFile success");
+        }
+        $log->info("==  end($flag) ==");
+        
+        exit 1;
+    }
+}
+
+# 计算同一个虚拟ip下的mysql实例数量
+my $count = `grep -v "#" $mhaVipConf | grep -wc $vrrpInstance`;
+chomp($count);
+if ( $count > 0 ) {
+    $log->debug("total number of mysql instance in vrrp instance $vrrpInstance is: $count");
+} else {
+    $log->error("no mysql instance in vrrp instance: $vrrpInstance");
+    exit 0;
+}
+
+# 计算单次检查超时时间
+my $timeout = $totalTimeout/$checkRetry - $intervalTime;
+$timeout = sprintf("%d", $timeout);
+if ( $timeout < 1 ){
+    $timeout = 1;
+}
+$log->debug("check timeout: $timeout"); 
+
+# 检查脚本退出码
+my $exitCode = 0;
+ 
+# 使用Parallel::ForkManager模块并行提升
+$log->info("*parallelCheck*:  start doing check");
+
+my $maxProcs = 15;
+my $pm = Parallel::ForkManager->new($maxProcs);
+
+$log->info("*parallelCheck*:   doing checks parallel...");  
+$log->info("*parallelCheck*:   use Parallel::ForkManager, maxProcs: $maxProcs"); 
+
+# 所有检查结果
+my %checkResult = ();
+
+# setup a callback when a child finishes up, so we can get it's exit code
+$pm->run_on_finish(  sub { 
+    my ( $pid, $exitCode, $target ) = @_;
+    
+    $log->info("[instance:$target]  target finish parallelCheck exitCode: $exitCode, pid: $pid");
+    if ( $exitCode == 1 ){
+        
+        $checkResult{$target} = 1;
+        $log->info("[instance:$target]  check success");           
+    }elsif ( $exitCode == 0 ){
+        
+        $checkResult{$target} = 0;
+        $log->error("[instance:$target]  check failed"); 
+    }
+});
+
+$pm->run_on_start(
+    sub { 
+        my ($pid, $target) = @_;
+        $log->info("[instance:$target]  target start parallelCheck, pid: $pid");
+    }
+);
+
+foreach my $line (@mhaVipConfData){
+    $line =~ s/^\s+//g;
+    
+    my ( $ismaintain,$viptype,$port,$vrrp,$vip,$gotofault ) = (split(/\s+/, $line));
+        
+    # 以实例端口号作为target名称
+    my $target = $port;
+    my $pid = $pm->start($target) and next;
+    
+    # 单个实例检查结果
+    my $exitCode;
+    eval {
+        $exitCode = &parallelCheck($ismaintain,$viptype,$port,$vrrp,$vip,$gotofault,$timeout);
+
+        if ( $exitCode == 1 ){
+            
+            # 检查成功
+            $pm->finish(1);
+        } elsif ( $exitCode == 0 ) {
+            
+            # 检查失败
+            $pm->finish(0);    
+        }
+    };
+    if ($@) {
+        $log->error("[instance:$port]  error in parallelCheck, $@");
+        undef $@;
+        $pm->finish(1);
+    }
+}
+
+$pm->wait_all_children;
+
+
+# 删除文件锁
+$log->info("start removing $lockFile");
+my $delFileLock = cleanFileLock($lockFile);
+if (!$delFileLock){
+    $log->error("remove $lockFile failed");
+}else{
+    $log->info("remove $lockFile success");
+}
+
+# 根据检查结果设置退出状态码
+my $allInstanceSuccess = 0;
+foreach my $target (keys %checkResult){
+    my $success = $checkResult{$target};
+    if ($success > 0){
+        $allInstanceSuccess = $allInstanceSuccess + 1;
+    }
+}
+
+if ( $allInstanceSuccess > 0 ) {
+    # 正常
+    $log->info("one of mysql instance is ok");
+    $exitCode = 0;
+} else {
+    # 异常
+    $log->error("all mysql instance is bad");
+    $exitCode = 1;
+}
+
+$log->info("================  end($flag)    =======================");
+
+# 结束    
+exit($exitCode);
+
+
+
+######################## Subroutines ########################
+
+# @Description: 并行检查
+# @Param: $ismaintain,$viptype,$port,$vrrp,$vip,$gotofault
+# @Return: 1:成功  2:忽略  0:失败
+sub parallelCheck{
+    my ( $ismaintain,$viptype,$port,$vrrp,$vip,$gotofault,$timeout ) = @_;
+    
+    my $log = Log::Log4perl->get_logger("");
+
+    my ($dbh,$dbiErrcode); 
+    
+    # 单个mysql实例检查结果标识
+    my $singleInstanceSuccess = 0;  
+    
+    # 设置检查失败重试机制
+    for ( my $i=0; $i<$checkRetry; $i++ ) {    
+        
+        $log->debug("instance:$port the check  ($i) times=");
+        
+        my $timeoutMsg = "CHK_TIMEOUT"; 
+        my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+        my $action = POSIX::SigAction->new( sub { die $timeoutMsg; },$sigset,);
+        my $oldaction = POSIX::SigAction->new();
+        sigaction( SIGALRM, $action, $oldaction ); 
+        
+        eval {
+            # 设置超时时间
+            alarm $timeout;
+            
+            # 1. 检查mysql连接
+            ( $dbh,$dbiErrcode ) = &mysqlConnect( $host, $port, $username, $password );
+            if ( ! defined($dbh) ) {               
+                if (defined($dbiErrcode)){
+                    die $dbiErrcode;
+                }else{
+                    die "connect failed";
+                }
+            }
+             
+            # 关闭session binary log
+            &mysqlExecute( $dbh, "set session sql_log_bin=0" );
+             
+            # 2. 检查mysql可读
+            my $showsql = "show variables like 'server_id%'";
+            my $queryResult = &mysqlQuery( $dbh, $showsql );
+            if ( ! $queryResult || ! %{$queryResult} ) {
+                die "check read_only failed";
+            }
+                    
+            # 关闭mysql连接
+            if ($dbh) { 
+                &mysqlDisconnect($dbh);
+            }
+    
+            # 设置检查结果为成功
+            $singleInstanceSuccess = 1;
+            
+            alarm 0;
+        };
+        alarm(0);
+        sigaction( SIGALRM, $oldaction );  # restore original signal handler
+    
+        # 若成功，结束循环
+        if ($singleInstanceSuccess == 1){
+            # 结束循环
+            last;
+        }
+            
+        # 若存在异常，则
+        if ( $@ ){        
+            if ( $@ =~ /$timeoutMsg/ ) {
+            # 发生超时
+                $log->error("instance:$port timeout: $@");
+            
+            } elsif ( grep ( $_ == $@, @ALIVE_ERROR_CODES )> 0 ) {
+            # mysql活着，但dbi连接错误, 此类问题不做主从切换    
+                $log->info("instance:$port  ignored: dbi err is $@");
+                
+                # 最后一次检查
+                if ( $i == ($checkRetry-1) ){            
+                    # 设置检查结果为成功
+                    $singleInstanceSuccess = 1;
+                    
+                    # 结束循环
+                    last;
+                }       
+            } else{
+            # 其它错误
+                $log->error("instance:$port failed: $@");
+            }
+              
+            # 关闭mysql连接
+            if ($dbh) { &mysqlDisconnect($dbh); }    
+    
+            # 最后一次检查
+            if ( $i == ($checkRetry-1) ){
+                # 结束循环            
+                last;
+            }             
+            
+            sleep $intervalTime;
+            # 重新检查
+            next;       
+        }
+    } # end for
+    
+    # 关闭mysql连接
+    if ($dbh) { &mysqlDisconnect($dbh); }
+
+    # 根据检查结果设置退出状态码
+    if ( $singleInstanceSuccess == 1 ) {
+        # 正常
+        $log->info("instance:$port is ok");
+    } else {
+        # 异常
+        $log->error("instance:$port is bad");
+    }
+    
+    return $singleInstanceSuccess;
+}
+
+# @Description: 创建mysql连接
+# @Param:
+# @Return:
+sub mysqlConnect {
+    my ( $host, $port, $user, $pass ) = @_;
+    my $dsn = "DBI:mysql:host=$host;port=$port";
+    $log->debug("$dsn, user:$user, pass:****");
+    
+    my $err;
+    my $dbh = DBI->connect( $dsn, $user, $pass, { PrintError => 0, RaiseError => 0, 
+                           AutoCommit => 1} );
+                    
+    if ($DBI::err){
+        $err = $DBI::err;
+    }
+    
+    return ($dbh, $err);
+}
+
+# @Description: 执行sql查询
+# @Param:
+# @Return:
+sub mysqlQuery {
+    my ( $dbh, $query ) = @_;
+    $log->debug("$query");
+    my $sth = $dbh->prepare($query);
+    my $res = $sth->execute;
+    return undef unless ($res);
+    my $row = $sth->fetchrow_hashref;
+    $sth->finish;
+    
+    return $row;
+}
+
+# @Description: 执行sql更新
+# @Param:
+# @Return:
+sub mysqlExecute {
+    my ( $dbh, $sql ) = @_;
+    $log->debug("$sql");
+    my $sth = $dbh->do($sql);
+
+    return;
+}
+
+# @Description: 关闭mysql连接
+# @Param:
+# @Return:
+sub mysqlDisconnect {
+    my ( $dbh ) = @_;
+    if ( defined($dbh) ) {
+        eval {
+            $log->debug("disconnect");
+            $dbh->disconnect();         
+        };
+        if($@){
+            undef $@;
+        }
+    }
+}
+
+# @Description:  加文件锁
+# @Param: 
+# @Return: 
+sub getFileLock{    
+    my ( $lockFile ) = @_;
+
+    my $log = Log::Log4perl->get_logger(""); 
+    my %flockStatus = ();
+            
+    eval {
+        if ( -e $lockFile ){
+            open (FD, " < $lockFile") or do {
+                $log->error("$lockFile has exist, but can not open it,$!");
+                exit 0;
+            };
+            
+            if( flock(FD, LOCK_EX | LOCK_NB) ){
+                $flockStatus{'exitCode'} = 0;
+            }else{
+                $flockStatus{'exitCode'} = 1;
+            }
+        } else {
+            open (FD, " > $lockFile") or do {
+                $log->error("Can not create $lockFile,$!");
+                exit 0;
+            };
+            if( flock(FD, LOCK_EX | LOCK_NB) ){
+                $flockStatus{'exitCode'} = 0;
+            }else{
+                $flockStatus{'exitCode'} = 1;
+            }               
+        }
+    };
+    if ($@){
+        undef $@;
+    }
+
+    return (\%flockStatus);
+}
+
+# @Description: 删除文件锁
+# @Param: 
+# @Return: 
+sub cleanFileLock{
+    my $lock = @_;
+    
+    my $log = Log::Log4perl->get_logger("");
+     
+    if ($lock) {
+        eval {
+            system("rm -f @_");
+        };
+        if ($@){
+            $log->error("del filelock failed");
+            undef $@;
+            
+            return;
+        }      
+    }
+    
+    return 1;
+}
+
+# @Description: 获取时间
+# @Param:
+# @Return:
+sub getLocaltime {
+    my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) = localtime(time());
+    $year = $year + 1900;
+    $mon++; 
+    my $localtime = $year . $mon . $mday . $hour . $min . $sec;
+    
+    return $localtime;
+}
+
+######################## END Subroutines ########################
