@@ -1,0 +1,201 @@
+#!/usr/bin/env perl
+# Description: vip manager
+# Authors: 
+#   zhaoyunbo
+
+use strict;
+use warnings FATAL => 'all';
+
+use Getopt::Long;
+use POSIX qw(:signal_h);
+
+# 变量定义
+my ( $command,$vip,$net_interface,$net_mask,$gateway,$help );
+
+# 获取参数
+GetOptions(
+    'command=s'             => \$command,
+    'vip=s'                 => \$vip,
+    'net_interface=s'       => \$net_interface,
+    'net_mask=s'            => \$net_mask,
+    'gateway=s'             => \$gateway,
+    'help'                  => \$help,
+);
+
+if ( $help) {
+    &usage;
+}
+
+# 检查参数值
+my $options_needed;
+( defined($command) ) or $options_needed .= "--command is needed !\n";
+( defined($vip) ) or $options_needed .= "--vip is needed !\n";
+( defined($net_interface) ) or $options_needed .= "--net_interface is needed !\n";
+( defined($net_mask) ) or $options_needed .= "--net_mask is needed !\n";
+( defined($gateway) ) or $options_needed .= "--gateway is needed !\n";
+if ( $options_needed ){  die( $options_needed . "\n" ); }
+
+chomp($command);
+chomp($vip);
+chomp($net_interface);
+chomp($net_mask);
+chomp($gateway);
+
+if ( $command eq "start" ){
+    
+    &start_vip($vip,$net_interface,$net_mask,$gateway);
+    
+}elsif ( $command eq "stop" ){
+    
+    &stop_vip($vip,$net_interface);
+
+}
+
+
+# @Description: 执行系统命令
+# @Param:
+# @Return: 返回命令执行结果:成功 undef:失败
+sub run_command {
+    my ( $command, $timeout ) = @_;
+
+    my $timeout_msg = "CMD_TIMEOUT";     
+    my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+    my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+    my $oldaction = POSIX::SigAction->new();
+    sigaction( SIGALRM, $action, $oldaction ); 
+
+    # 执行命令
+    my $result;    
+    eval {
+        alarm $timeout;
+        $result = `$command`;
+        alarm 0;    
+    };
+    alarm 0; 
+    sigaction( SIGALRM, $oldaction );  # restore original signal handler
+    
+    # 异常处理
+    if ( $@ ) {
+        if ( $@ =~ /$timeout_msg/ ) {
+            print "run command: $command timeout\n";
+        }else{
+            print "run command: $command failed\n";
+        }
+        undef $@;
+
+        return;
+    }
+
+    # 返回命令执行结果
+    print "run command: $command success\n";
+
+    return $result;
+}
+
+# @Description: 启用vip
+# @Param: 
+# @Return: 0:成功 1:失败
+sub start_vip {
+    my ( $vip,$net_interface,$net_mask,$gateway ) = @_;
+
+    my $check_result = &check_vip($vip);
+    chomp($check_result);
+    if ( $check_result == 0 ){
+        print "vip:$vip exist, exit start_vip\n";
+        
+        exit 0;     
+    }
+
+    my @vip_str = split(/\./, $vip);
+    my $vip_suffix = $vip_str[2] . $vip_str[3];
+
+    # 启用vip命令
+    my $start_vip_cmd = "sudo /sbin/ifconfig $net_interface:$vip_suffix $vip netmask $net_mask && sudo /sbin/arping -c 3 -s $vip -I $net_interface $gateway";
+    my $ssh_cmd = "$start_vip_cmd";
+    
+    # 启用vip
+    &run_command($ssh_cmd, 10);
+
+    # 检查启用vip命令
+    my $check_vip_cmd = "/sbin/ip a|grep '$vip'";
+    my $check_vip_ssh_cmd = "$check_vip_cmd";
+    
+    # 检查启用vip结果
+    my $check_vip_result = &run_command($check_vip_ssh_cmd, 10);    
+    if ( $check_vip_result =~ /$vip/ ){
+        print "start vip $vip success\n";
+
+        return 0;
+    } else {
+        print "start vip $vip failed\n";
+       
+        return 1;
+    }
+}
+
+# @Description: 移除vip
+# @Param: 
+# @Return: 0:成功 1:失败
+sub stop_vip {
+    my ( $vip,$net_interface ) = @_;
+
+    my $check_result = &check_vip($vip);
+    chomp($check_result);
+    if ( $check_result == 1 ){
+        print "vip:$vip not exist, exit stop_vip\n";
+        
+        exit 0;     
+    }
+
+    my @vip_str = split(/\./, $vip);
+    my $vip_suffix = $vip_str[2] . $vip_str[3];
+    
+    # 移除vip命令
+    my $stop_vip_cmd = "sudo /sbin/ifconfig $net_interface:$vip_suffix down";
+    my $ssh_cmd = "$stop_vip_cmd";
+
+    # 移除vip    
+    &run_command($ssh_cmd, 10);
+
+    # 检查移除vip命令
+    my $check_vip_cmd = "/sbin/ip a|grep '$vip'";
+    my $check_vip_ssh_cmd = "$check_vip_cmd";
+
+    # 检查移除vip结果
+    my $check_vip_result = &run_command($check_vip_ssh_cmd, 10);
+    if ( $check_vip_result =~ /$vip/ ){
+        print "stop vip $vip failed\n";
+
+        return 1;
+    } else {
+        print "stop vip $vip success\n";
+        
+        return 0;
+    }
+}
+
+# @Description: 检查vip存在
+# @Param: 
+# @Return: 0:存在 1:不存在
+sub check_vip {
+    my ( $vip ) = @_;
+
+    # 检查vip命令
+    my $check_vip_cmd = "/sbin/ip a|grep '$vip'";
+    my $check_vip_ssh_cmd = "$check_vip_cmd";
+
+    # 检查vip结果
+    my $check_vip_result = &run_command($check_vip_ssh_cmd, 10);
+    if ( $check_vip_result =~ /$vip/ ){
+        return 0;
+    } else {        
+        return 1;
+    }
+}
+
+# @Description: 使用说明
+# @Param: 
+# @Return: 
+sub usage {
+    print "Usage: vip_manager --command=start|stop --vip=vip --net_interface=net_interface --net_mask=net_mask --gateway=gateway\n";
+}
