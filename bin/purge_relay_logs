@@ -26,6 +26,8 @@ use Getopt::Long;
 use Pod::Usage;
 use File::Basename;
 use Sys::Hostname;
+use File::Path qw(make_path remove_tree);
+
 use MHA::BinlogManager;
 use MHA::SlaveUtil;
 use MHA::NodeUtil;
@@ -48,7 +50,7 @@ GetOptions(
     use_hardlink=i
     /,
 ) or pod2usage(1);
-$opt{workdir}      ||= "/var/tmp";
+$opt{workdir}      ||= "/data/backups";
 $opt{user}         ||= "root";
 $opt{password}     ||= "";
 $opt{host}         ||= "127.0.0.1";
@@ -68,6 +70,11 @@ if ( $opt{help} ) {
 if ( $opt{version} ) {
   print "purge_relay_logs version $MHA::NodeConst::VERSION.\n";
   exit 0;
+}
+
+if ( ! -d $opt{workdir} ){
+  print "create hard link dir: $opt{workdir}\n";
+  mkdir("$opt{workdir}");
 }
 
 exit &main();
@@ -169,25 +176,32 @@ sub save_error_log {
 
 sub main {
   my $exit_code = 1;
+  
   eval {
     check_local();
+
     my $start = MHA::NodeUtil::current_time();
     print "$start: purge_relay_logs script started.\n";
 
     $_binlog_manager = new MHA::BinlogManager();
+
     my $dsn = "DBI:mysql:;host=$opt{host};port=$opt{port}";
     if ( defined( $opt{socket} ) ) {
       $dsn .= ";mysql_socket=$opt{socket}";
     }
+
     if ( defined( $opt{defaults_file} ) ) {
       $dsn .= ";mysql_read_default_file=$opt{defaults_file}";
     }
     my $dbh =
       DBI->connect( $dsn, $opt{user}, $opt{password},
       { PrintError => 0, RaiseError => 1 } );
+    
     croak " Failed to get DB Handle on $opt{host}!\n" unless ($dbh);
-    croak " Target mysql server is not defined as replication slave.\n"
+    
+    croak " Target mysql server is not a slave.\n"
       if ( !MHA::SlaveUtil::is_slave($dbh) );
+    
     if ( MHA::SlaveUtil::is_relay_log_purge($dbh) ) {
 
       if ( $opt{disable_relay_log_purge} ) {
@@ -201,31 +215,23 @@ sub main {
     }
 
     my ( $relay_dir, $current_relay_log );
-    if ( MHA::SlaveUtil::get_relay_log_info_type($dbh) eq "TABLE" ) {
-      ( $relay_dir, $current_relay_log ) =
-        MHA::SlaveUtil::get_relay_dir_file_from_table($dbh);
-      if ( !$relay_dir || !$current_relay_log ) {
-        croak
-"Getting relay log directory or current relay logfile from replication table failed!\n";
-      }
-      $_binlog_manager->init_from_dir_file( $relay_dir, $current_relay_log );
+    
+    $_relay_log_info_path = MHA::SlaveUtil::get_relay_log_info_path($dbh)
+    unless ($_relay_log_info_path);
+    
+    unless ($_relay_log_info_path) {
+      croak " Failed to get relay_log_info file path!\n";
+    }
+    
+    if ( !-f $_relay_log_info_path ) {
+      croak " $_relay_log_info_path does NOT exist.\n";
     }
     else {
-      $_relay_log_info_path = MHA::SlaveUtil::get_relay_log_info_path($dbh)
-        unless ($_relay_log_info_path);
-      unless ($_relay_log_info_path) {
-        croak " Failed to get relay_log_info file path!\n";
-      }
-      if ( !-f $_relay_log_info_path ) {
-        croak " $_relay_log_info_path does NOT exist.\n";
-      }
-      else {
-        print " Found relay_log.info: $_relay_log_info_path\n";
-      }
-
-      $_binlog_manager->init_from_relay_log_info($_relay_log_info_path);
-      $current_relay_log = $_binlog_manager->{cur_log};
+      print " Found relay_log.info: $_relay_log_info_path\n";
     }
+
+    $_binlog_manager->init_from_relay_log_info($_relay_log_info_path);
+    $current_relay_log = $_binlog_manager->{cur_log};
 
     if ( $opt{use_hard_link} ) {
       remove_hardlinked_relay_logs();
@@ -271,9 +277,8 @@ purge_relay_logs - Deleting relay logs without blocking SQL threads
 
 =head1 SYNOPSIS
 
-purge_relay_logs --user=root --password=rootpass --host=127.0.0.1
-
-See online reference (http://code.google.com/p/mysql-master-ha/wiki/Requirements#purge_relay_logs_script) for details.
+/usr/bin/purge_relay_logs --user=mysqlha --password=hahalxxxx --host=127.0.0.1 --port=3312 
+--disable_relay_log_purge --use_hardlink=1 --workdir=/data/backups/my3312
 
 =head1 DESCRIPTION
 

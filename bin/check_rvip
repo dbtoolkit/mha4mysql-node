@@ -16,7 +16,7 @@ use Fcntl qw(:flock);
 
 # 数据库连接信息
 my $host = "127.0.0.1";
-my $username = "mysql";
+my $username = "mysqlha";
 my $password = "xxxx";
 
 # mha vip配置文件
@@ -191,7 +191,7 @@ $log->debug("check timeout: $timeout");
 # 检查脚本退出码
 my $exitCode = 0;
  
-# 使用Parallel::ForkManager模块并行提升
+# 使用Parallel::ForkManager模块并行检查
 $log->info("*parallelCheck*:  start doing check");
 
 my $maxProcs = 15;
